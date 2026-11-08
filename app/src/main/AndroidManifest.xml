@@ -10,6 +10,7 @@
 
     <application
         android:allowBackup="true"
+        android:icon="@drawable/logo"
         android:label="JISNEX Live"
         android:theme="@style/AppTheme">
 
