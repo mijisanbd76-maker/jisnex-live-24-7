@@ -13,13 +13,13 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.os.SystemClock
+import com.pedro.common.ConnectChecker
 import com.pedro.encoder.input.decoder.AudioDecoderInterface
 import com.pedro.encoder.input.decoder.VideoDecoderInterface
 import com.pedro.library.rtmp.RtmpFromFile
-import com.pedro.rtmp.utils.ConnectCheckerRtmp
 import java.io.File
 
-class StreamService : Service(), ConnectCheckerRtmp, VideoDecoderInterface, AudioDecoderInterface {
+class StreamService : Service(), ConnectChecker, VideoDecoderInterface, AudioDecoderInterface {
 
     interface Listener {
         fun onState(msg: String, streaming: Boolean)
@@ -74,7 +74,7 @@ class StreamService : Service(), ConnectCheckerRtmp, VideoDecoderInterface, Audi
             }
             val s = RtmpFromFile(this, this, this)
             s.setLoopMode(loop)
-            if (!s.prepareVideo(f.absolutePath, bitrate)) {
+            if (!s.prepareVideo(f.absolutePath, bitrate, 0)) {
                 stopAll("Video prepare failed (unsupported file?)"); return
             }
             if (!s.prepareAudio(f.absolutePath, 128 * 1024)) {
@@ -137,13 +137,13 @@ class StreamService : Service(), ConnectCheckerRtmp, VideoDecoderInterface, Audi
     }
 
     // ---- RTMP callbacks ----
-    override fun onConnectionStartedRtmp(rtmpUrl: String) { listener?.onState("Connecting...", true) }
-    override fun onConnectionSuccessRtmp() { listener?.onState("LIVE", true) }
-    override fun onConnectionFailedRtmp(reason: String) { stopAll("Connection failed: $reason") }
-    override fun onNewBitrateRtmp(bitrate: Long) { listener?.onBitrate(bitrate / 1000) }
-    override fun onDisconnectRtmp() { if (active) stopAll("Disconnected") }
-    override fun onAuthErrorRtmp() { stopAll("Auth error (check stream key)") }
-    override fun onAuthSuccessRtmp() {}
+    override fun onConnectionStarted(url: String) { listener?.onState("Connecting...", true) }
+    override fun onConnectionSuccess() { listener?.onState("LIVE", true) }
+    override fun onConnectionFailed(reason: String) { stopAll("Connection failed: $reason") }
+    override fun onNewBitrate(bitrate: Long) { listener?.onBitrate(bitrate / 1000) }
+    override fun onDisconnect() { if (active) stopAll("Disconnected") }
+    override fun onAuthError() { stopAll("Auth error (check stream key)") }
+    override fun onAuthSuccess() {}
 
     // ---- decoder callbacks ----
     override fun onVideoDecoderFinished() { loops++; listener?.onLoop(loops) }
