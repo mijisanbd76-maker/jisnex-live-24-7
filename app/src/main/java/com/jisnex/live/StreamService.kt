@@ -7,10 +7,14 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
 import com.pedro.common.ConnectChecker
@@ -36,9 +40,21 @@ class StreamService : Service(), ConnectChecker, VideoDecoderInterface, AudioDec
         private const val CH = "jisnex_live"
     }
 
+    private val main = Handler(Looper.getMainLooper())
+    private val lock = Any()
+
     private var stream: RtmpFromFile? = null
     private var wake: PowerManager.WakeLock? = null
     private var wifi: WifiManager.WifiLock? = null
+
+    private var srcFile: File? = null
+    private var fullUrl = ""
+    private var bitrate = 2_500_000
+    private var loopMode = true
+
+    @Volatile private var retrying = false
+    @Volatile private var everConnected = false
+    @Volatile private var attempt = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -58,41 +74,99 @@ class StreamService : Service(), ConnectChecker, VideoDecoderInterface, AudioDec
         val uri = Uri.parse(intent.getStringExtra("uri"))
         val url = intent.getStringExtra("url") ?: ""
         val key = intent.getStringExtra("key") ?: ""
-        val bitrate = intent.getIntExtra("bitrate", 2_500_000)
-        val loop = intent.getBooleanExtra("loop", true)
+        bitrate = intent.getIntExtra("bitrate", 2_500_000)
+        loopMode = intent.getBooleanExtra("loop", true)
+        fullUrl = url.trimEnd('/') + "/" + key
 
-        Thread { begin(uri, url, key, bitrate, loop) }.start()
+        retrying = false
+        everConnected = false
+        attempt = 0
+
+        Thread { begin(uri) }.start()
         return START_NOT_STICKY
     }
 
-    private fun begin(uri: Uri, url: String, key: String, bitrate: Int, loop: Boolean) {
+    private fun begin(uri: Uri) {
         try {
             listener?.onState("Preparing video...", true)
             val f = File(cacheDir, "source_video")
             contentResolver.openInputStream(uri).use { input ->
                 f.outputStream().use { out -> input!!.copyTo(out) }
             }
-            val s = RtmpFromFile(this, this, this)
-            s.setLoopMode(loop)
-            if (!s.prepareVideo(f.absolutePath, bitrate, 0)) {
-                stopAll("Video prepare failed (unsupported file?)"); return
-            }
-            if (!s.prepareAudio(f.absolutePath, 128 * 1024)) {
-                stopAll("Audio prepare failed"); return
-            }
-            stream = s
-            s.startStream(url.trimEnd('/') + "/" + key)
+            srcFile = f
+            connect()
         } catch (e: Exception) {
             stopAll("Error: " + (e.message ?: e.javaClass.simpleName))
         }
     }
 
-    private fun stopAll(msg: String) {
+    private fun connect() {
+        synchronized(lock) {
+            if (!active) return
+            val f = srcFile ?: return
+            try {
+                val s = RtmpFromFile(this, this, this)
+                s.setLoopMode(loopMode)
+                if (!s.prepareVideo(f.absolutePath, bitrate, 0)) {
+                    stopAll("Video prepare failed (unsupported file?)"); return
+                }
+                if (!s.prepareAudio(f.absolutePath, 128 * 1024)) {
+                    stopAll("Audio prepare failed"); return
+                }
+                stream = s
+                s.startStream(fullUrl)
+                if (!active) releaseStream()
+            } catch (e: Exception) {
+                onLinkLost(e.message ?: e.javaClass.simpleName)
+            }
+        }
+    }
+
+    private fun hasNet(): Boolean {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val n = cm.activeNetwork ?: return false
+        val c = cm.getNetworkCapabilities(n) ?: return false
+        return c.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+
+    private fun onLinkLost(reason: String) {
+        if (!active) return
+        if (retrying) return
+        attempt++
+        if (!everConnected && attempt >= 3) {
+            stopAll("Connection failed: $reason")
+            return
+        }
+        retrying = true
+        releaseStream()
+        listener?.onState("Reconnecting... ($attempt)", true)
+        val delay = minOf(3000L + attempt * 2000L, 10000L)
+        main.postDelayed({ Thread { retryNow() }.start() }, delay)
+    }
+
+    private fun retryNow() {
+        if (!active) return
+        if (!hasNet()) {
+            listener?.onState("Waiting for internet...", true)
+            main.postDelayed({ Thread { retryNow() }.start() }, 4000)
+            return
+        }
+        retrying = false
+        connect()
+    }
+
+    private fun releaseStream() {
         try {
             stream?.let { if (it.isStreaming) it.stopStream() }
         } catch (_: Exception) {}
         stream = null
+    }
+
+    private fun stopAll(msg: String) {
         active = false
+        retrying = false
+        main.removeCallbacksAndMessages(null)
+        releaseStream()
         releaseLocks()
         listener?.onState(msg, false)
         stopForeground(true)
@@ -138,10 +212,15 @@ class StreamService : Service(), ConnectChecker, VideoDecoderInterface, AudioDec
 
     // ---- RTMP callbacks ----
     override fun onConnectionStarted(url: String) { listener?.onState("Connecting...", true) }
-    override fun onConnectionSuccess() { listener?.onState("LIVE", true) }
-    override fun onConnectionFailed(reason: String) { stopAll("Connection failed: $reason") }
+    override fun onConnectionSuccess() {
+        everConnected = true
+        attempt = 0
+        retrying = false
+        listener?.onState("LIVE", true)
+    }
+    override fun onConnectionFailed(reason: String) { onLinkLost(reason) }
     override fun onNewBitrate(bitrate: Long) { listener?.onBitrate(bitrate / 1000) }
-    override fun onDisconnect() { if (active) stopAll("Disconnected") }
+    override fun onDisconnect() { onLinkLost("Disconnected") }
     override fun onAuthError() { stopAll("Auth error (check stream key)") }
     override fun onAuthSuccess() {}
 
